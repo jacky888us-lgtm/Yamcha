@@ -1,0 +1,1134 @@
+--[[
+  Wrench Fruit Finder - Blox Fruits, client-side Luau for an executor.
+  STATUS: never run in any executor by me. Nothing below was verified on a live Blox Fruits build.
+
+  Provenance of build-dependent values: NONE came from a dump, log or screenshot you gave me.
+  Every such value is either nil (UNSET, feature gated visibly) or labeled ASSUMPTION / UNCALIBRATED.
+
+  Install (executor workspace folder):
+    WrenchFruit/WrenchFruitFinder.lua   <- this file (needed so Hunt can re-run it after each hop)
+    WrenchFruit/logo.png                <- logo image
+  Run:  loadstring(readfile("WrenchFruit/WrenchFruitFinder.lua"))()
+]]
+
+------------------------------------------------------------------------
+-- Single-instance guard
+------------------------------------------------------------------------
+local genv = (getgenv and getgenv()) or _G
+if genv.WrenchFruitFinder and genv.WrenchFruitFinder.Unload then
+	pcall(genv.WrenchFruitFinder.Unload)
+end
+
+------------------------------------------------------------------------
+-- Services
+------------------------------------------------------------------------
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+------------------------------------------------------------------------
+-- CONFIG  (every build-dependent value lives here)
+------------------------------------------------------------------------
+local CONFIG = {
+	-- nil = unknown. If unknown, the matching feature is gated and says so in the status bar.
+	ExpectedPlaceIds = nil, -- UNSET. Optional set like { [123] = true }; a mismatch only warns.
+
+	Fruit = {
+		-- UNSET: substring of the spawned fruit's Instance.Name. Fruit detection and Hunt stay gated
+		-- until you set it from the Dump output (see the recipe in my reply).
+		NameContains = nil, -- string | nil
+		-- ASSUMPTION: spawned fruit is a direct child of Workspace. Confirm with Dump / Dex.
+		Containers = { workspace },
+		ScanDescendants = false,
+		-- Optional extra filter, function(inst) -> boolean. nil = accept every name match.
+		Accept = nil,
+		-- Raw Instance.Name. Where the real display name lives on this build is UNKNOWN.
+		DisplayName = function(inst)
+			return inst.Name
+		end,
+	},
+
+	Teleport = {
+		HoverOffset = Vector3.new(0, 3, 0), -- plain TP, stay above the fruit (UNCALIBRATED)
+		GrabOffset = Vector3.new(0, 0, 0), -- teleport-grab, body must overlap the fruit (UNCALIBRATED)
+		TweenSpeed = 250, -- studs/second (UNCALIBRATED)
+		MaxAbsCoordinate = 1e7, -- sanity bound for "absurd coordinates", not a game value
+	},
+
+	Grab = {
+		TouchConfirmSeconds = 1.0, -- UNCALIBRATED
+		TeleportConfirmSeconds = 1.5, -- UNCALIBRATED
+		ReturnAfterGrab = true, -- go back to where you stood after a teleport-grab
+		AutoGrabIntervalSeconds = 1.0,
+	},
+
+	Servers = {
+		MaxPages = 3,
+		MinFreeSlots = 2, -- skip servers closer to full than this (UNCALIBRATED)
+		VisitedTtlSeconds = 1800,
+		ListRows = 12,
+	},
+
+	Hunt = {
+		SettleSeconds = 8, -- wait after joining before scanning (UNCALIBRATED)
+		RetrySeconds = 4,
+	},
+
+	UI = {
+		RefreshSeconds = 0.5,
+		MaxRows = 12,
+		ToggleKey = Enum.KeyCode.RightShift,
+	},
+
+	Paths = {
+		Dir = "WrenchFruit",
+		Logo = "logo.png",
+		Script = "WrenchFruitFinder.lua",
+		State = "state.json",
+		Dump = "dump.txt",
+	},
+}
+
+------------------------------------------------------------------------
+-- Executor capabilities (nil when absent)
+------------------------------------------------------------------------
+local EX = {
+	gethui = gethui,
+	queue = queue_on_teleport or (syn and syn.queue_on_teleport) or nil,
+	request = request or http_request or (syn and syn.request) or nil,
+	firetouch = firetouchinterest,
+	getcustomasset = getcustomasset or getsynasset,
+	isfile = isfile,
+	readfile = readfile,
+	writefile = writefile,
+	isfolder = isfolder,
+	makefolder = makefolder,
+	setclipboard = setclipboard,
+	protect = (syn and syn.protect_gui) or nil,
+}
+
+------------------------------------------------------------------------
+-- Pure helpers (checkable without the game)
+------------------------------------------------------------------------
+local function matchesName(name, needle)
+	if type(name) ~= "string" or type(needle) ~= "string" or needle == "" then
+		return false
+	end
+	return string.find(string.lower(name), string.lower(needle), 1, true) ~= nil
+end
+
+local function formatDistance(d)
+	if type(d) ~= "number" or d ~= d or d == math.huge then
+		return "?"
+	end
+	if d >= 1000 then
+		return string.format("%.1fk", d / 1000)
+	end
+	return string.format("%d", math.floor(d + 0.5))
+end
+
+local function isFinite(n)
+	return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
+end
+
+local function isSanePosition(v, bound)
+	return isFinite(v.X) and isFinite(v.Y) and isFinite(v.Z)
+		and math.abs(v.X) < bound and math.abs(v.Y) < bound and math.abs(v.Z) < bound
+end
+
+local function pruneVisited(visited, now, ttl)
+	local out = {}
+	for id, ts in pairs(visited) do
+		if type(id) == "string" and type(ts) == "number" and now - ts < ttl then
+			out[id] = ts
+		end
+	end
+	return out
+end
+
+-- servers: array of { id, playing, maxPlayers }. rand(lo, hi) -> integer.
+local function chooseServer(servers, visited, currentJobId, now, ttl, minFreeSlots, rand)
+	local pool = {}
+	for _, s in ipairs(servers) do
+		if type(s) == "table" and type(s.id) == "string" and s.id ~= currentJobId
+			and isFinite(s.playing) and isFinite(s.maxPlayers)
+			and s.playing + minFreeSlots <= s.maxPlayers then
+			local seen = visited[s.id]
+			if not (seen and now - seen < ttl) then
+				pool[#pool + 1] = s
+			end
+		end
+	end
+	if #pool == 0 then
+		return nil
+	end
+	return pool[rand(1, #pool)]
+end
+
+------------------------------------------------------------------------
+-- Lifetime / cleanup
+------------------------------------------------------------------------
+local alive = true
+local connections = {}
+local gui
+
+local function track(conn)
+	connections[#connections + 1] = conn
+	return conn
+end
+
+------------------------------------------------------------------------
+-- Persistent state (settings + hunt flag + visited servers)
+------------------------------------------------------------------------
+local P = CONFIG.Paths
+local function path(name)
+	return P.Dir .. "/" .. name
+end
+
+local state = {
+	hunting = false,
+	visited = {},
+	settings = { AutoGrab = false, InstantTP = false, GrabMode = "Auto" },
+}
+
+local function ensureDir()
+	if EX.isfolder and EX.makefolder and not EX.isfolder(P.Dir) then
+		pcall(EX.makefolder, P.Dir)
+	end
+end
+
+local function loadState()
+	if not (EX.isfile and EX.readfile) or not EX.isfile(path(P.State)) then
+		return
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(EX.readfile(path(P.State)))
+	end)
+	if not ok or type(decoded) ~= "table" then
+		return
+	end
+	state.hunting = decoded.hunting == true
+	if type(decoded.visited) == "table" then
+		state.visited = pruneVisited(decoded.visited, os.time(), CONFIG.Servers.VisitedTtlSeconds)
+	end
+	if type(decoded.settings) == "table" then
+		local s = decoded.settings
+		state.settings.AutoGrab = s.AutoGrab == true
+		state.settings.InstantTP = s.InstantTP == true
+		if s.GrabMode == "Auto" or s.GrabMode == "Touch" or s.GrabMode == "Teleport" then
+			state.settings.GrabMode = s.GrabMode
+		end
+	end
+end
+
+local function saveState()
+	if not EX.writefile then
+		return
+	end
+	ensureDir()
+	pcall(function()
+		EX.writefile(path(P.State), HttpService:JSONEncode(state))
+	end)
+end
+
+loadState()
+local Settings = state.settings
+
+------------------------------------------------------------------------
+-- Status + notifications
+------------------------------------------------------------------------
+local statusLabel
+local function setStatus(text)
+	if statusLabel then
+		statusLabel.Text = text
+	end
+end
+
+local function notify(title, text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = 6 })
+	end)
+end
+
+------------------------------------------------------------------------
+-- Fruit discovery
+------------------------------------------------------------------------
+local function getRoot()
+	local ch = LocalPlayer.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") and root.Parent then
+		return root
+	end
+	return nil
+end
+
+local function resolvePart(inst)
+	if inst:IsA("BasePart") then
+		return inst
+	end
+	if inst:IsA("Tool") then
+		local h = inst:FindFirstChild("Handle")
+		if h and h:IsA("BasePart") then
+			return h
+		end
+	end
+	return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function toFruit(inst)
+	local needle = CONFIG.Fruit.NameContains
+	if not needle or not matchesName(inst.Name, needle) then
+		return nil
+	end
+	if Players:GetPlayerFromCharacter(inst) then
+		return nil
+	end
+	if CONFIG.Fruit.Accept and not CONFIG.Fruit.Accept(inst) then
+		return nil
+	end
+	local part = resolvePart(inst)
+	if not part or not isSanePosition(part.Position, CONFIG.Teleport.MaxAbsCoordinate) then
+		return nil
+	end
+	return { inst = inst, part = part, parent = inst.Parent, name = CONFIG.Fruit.DisplayName(inst) }
+end
+
+-- Returns array sorted by distance (unknown distance last).
+local function scanFruits()
+	local out = {}
+	if not CONFIG.Fruit.NameContains then
+		return out
+	end
+	for _, container in ipairs(CONFIG.Fruit.Containers) do
+		if container and container.Parent then
+			local list = CONFIG.Fruit.ScanDescendants and container:GetDescendants() or container:GetChildren()
+			for _, inst in ipairs(list) do
+				local f = toFruit(inst)
+				if f then
+					out[#out + 1] = f
+				end
+			end
+		end
+	end
+	local root = getRoot()
+	for _, f in ipairs(out) do
+		f.distance = root and (f.part.Position - root.Position).Magnitude or nil
+	end
+	table.sort(out, function(a, b)
+		if a.distance and b.distance then
+			return a.distance < b.distance
+		end
+		return a.distance ~= nil
+	end)
+	return out
+end
+
+local function dumpWorkspace()
+	local lines = { string.format("# PlaceId %d  JobId %s", game.PlaceId, game.JobId), "# ClassName\tName\tHasBasePart" }
+	for _, inst in ipairs(workspace:GetChildren()) do
+		lines[#lines + 1] = string.format("%s\t%s\t%s", inst.ClassName, inst.Name, tostring(resolvePart(inst) ~= nil))
+	end
+	local text = table.concat(lines, "\n")
+	ensureDir()
+	local wrote = EX.writefile and pcall(EX.writefile, path(P.Dump), text)
+	local copied = EX.setclipboard and pcall(EX.setclipboard, text)
+	setStatus(string.format("dump: %d rows%s%s", #lines - 2, wrote and " -> file" or "", copied and " + clipboard" or ""))
+end
+
+------------------------------------------------------------------------
+-- Teleport + grab
+------------------------------------------------------------------------
+local busy = false
+
+local function waitUntil(pred, timeout)
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		if pred() then
+			return true
+		end
+		task.wait(0.05)
+	end
+	return pred()
+end
+
+local function fruitGone(f)
+	return not f.part:IsDescendantOf(workspace)
+end
+
+local function pickedUp(f)
+	return f.inst.Parent ~= f.parent
+end
+
+local function teleportTo(f, offset)
+	local root = getRoot()
+	if not root then
+		return false, "no character"
+	end
+	if fruitGone(f) then
+		return false, "fruit gone"
+	end
+	local function goal()
+		return CFrame.new(f.part.Position + offset)
+	end
+	if Settings.InstantTP then
+		root.CFrame = goal()
+	else
+		local dist = (f.part.Position + offset - root.Position).Magnitude
+		local tween = TweenService:Create(
+			root,
+			TweenInfo.new(math.max(dist / CONFIG.Teleport.TweenSpeed, 0.05), Enum.EasingStyle.Linear),
+			{ CFrame = goal() }
+		)
+		tween:Play()
+		while tween.PlaybackState == Enum.PlaybackState.Playing do
+			if not alive or not root.Parent or fruitGone(f) then
+				tween:Cancel()
+				return false, "fruit gone or character lost"
+			end
+			task.wait()
+		end
+	end
+	if fruitGone(f) or not root.Parent then
+		return false, "fruit gone"
+	end
+	root.CFrame = goal() -- final snap to the fruit's current position
+	root.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+local function grab(f)
+	local root = getRoot()
+	if not root then
+		return false, "no character"
+	end
+	if fruitGone(f) then
+		return false, "fruit gone"
+	end
+	local mode = Settings.GrabMode
+
+	if mode ~= "Teleport" then
+		if EX.firetouch then
+			pcall(EX.firetouch, root, f.part, 0)
+			task.wait()
+			pcall(EX.firetouch, root, f.part, 1)
+			if waitUntil(function()
+				return pickedUp(f)
+			end, CONFIG.Grab.TouchConfirmSeconds) then
+				return true, "touch"
+			end
+		elseif mode == "Touch" then
+			return false, "firetouchinterest missing"
+		end
+		if mode == "Touch" then
+			return false, "touch not confirmed"
+		end
+	end
+
+	local origin = root.CFrame
+	local ok, why = teleportTo(f, CONFIG.Teleport.GrabOffset)
+	local got = ok and waitUntil(function()
+		return pickedUp(f)
+	end, CONFIG.Grab.TeleportConfirmSeconds)
+	if CONFIG.Grab.ReturnAfterGrab and root.Parent then
+		root.CFrame = origin
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	if got then
+		return true, "teleport"
+	end
+	return false, ok and "pickup not confirmed" or why
+end
+
+local function runExclusive(label, fn)
+	if busy then
+		setStatus("busy, wait a sec")
+		return
+	end
+	busy = true
+	task.spawn(function()
+		local ok, a, b = pcall(fn)
+		busy = false
+		if not ok then
+			setStatus(label .. " error: " .. tostring(a))
+		elseif a == false then
+			setStatus(label .. " failed: " .. tostring(b))
+		elseif a == true then
+			setStatus(label .. " ok" .. (b and (" (" .. tostring(b) .. ")") or ""))
+		end
+	end)
+end
+
+------------------------------------------------------------------------
+-- Server list + hunt
+------------------------------------------------------------------------
+local function httpGet(url)
+	if EX.request then
+		local ok, res = pcall(EX.request, { Url = url, Method = "GET" })
+		if ok and type(res) == "table" then
+			return res.StatusCode, res.Body
+		end
+		return nil, tostring(res)
+	end
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok then
+		return 200, body
+	end
+	return nil, tostring(body)
+end
+
+-- Partial page failure = failure (returns nil, reason).
+local function fetchServers()
+	local all, cursor = {}, nil
+	for _ = 1, CONFIG.Servers.MaxPages do
+		local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
+		if cursor then
+			url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+		end
+		local status, body = httpGet(url)
+		if status ~= 200 then
+			return nil, "HTTP " .. tostring(status) .. " " .. string.sub(tostring(body), 1, 60)
+		end
+		local ok, decoded = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not ok or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+			return nil, "unexpected response shape"
+		end
+		for _, s in ipairs(decoded.data) do
+			all[#all + 1] = s
+		end
+		cursor = decoded.nextPageCursor
+		if type(cursor) ~= "string" then
+			break
+		end
+	end
+	return all
+end
+
+local hunting = false
+local huntToken = 0
+local queued = false
+local huntToggle -- set by UI
+
+local function canHunt()
+	if not CONFIG.Fruit.NameContains then
+		return false, "fruit matcher unset (use Dump)"
+	end
+	if not EX.queue then
+		return false, "queue_on_teleport missing"
+	end
+	if not (EX.isfile and EX.readfile and EX.writefile) then
+		return false, "file functions missing"
+	end
+	if not EX.isfile(path(P.Script)) then
+		return false, "save script to workspace/" .. path(P.Script)
+	end
+	return true
+end
+
+local function stopHunt(msg)
+	hunting = false
+	huntToken = huntToken + 1
+	state.hunting = false
+	saveState()
+	if huntToggle then
+		huntToggle.set(false)
+	end
+	if msg then
+		setStatus(msg)
+	end
+end
+
+local function teleportToServer(jobId)
+	local ok, err = pcall(TeleportService.TeleportToPlaceInstance, TeleportService, game.PlaceId, jobId, LocalPlayer)
+	return ok, err
+end
+
+local function hop(token)
+	while alive and hunting and token == huntToken do
+		setStatus("hunt: fetching servers...")
+		local list, err = fetchServers()
+		if not list then
+			setStatus("hunt: list failed - " .. tostring(err))
+			task.wait(CONFIG.Hunt.RetrySeconds)
+			continue
+		end
+		local now = os.time()
+		state.visited = pruneVisited(state.visited, now, CONFIG.Servers.VisitedTtlSeconds)
+		local pick = chooseServer(list, state.visited, game.JobId, now, CONFIG.Servers.VisitedTtlSeconds, CONFIG.Servers.MinFreeSlots, math.random)
+		if not pick then
+			setStatus("hunt: no unvisited server, clearing history")
+			state.visited = {}
+			task.wait(CONFIG.Hunt.RetrySeconds)
+			continue
+		end
+		state.visited[game.JobId] = now
+		state.visited[pick.id] = now
+		saveState()
+		if not queued then
+			local okRead, src = pcall(EX.readfile, path(P.Script))
+			if not okRead or type(src) ~= "string" or #src == 0 then
+				stopHunt("hunt stopped: cannot read " .. path(P.Script))
+				return
+			end
+			EX.queue(src)
+			queued = true
+		end
+		setStatus(string.format("hunt: joining %s (%d/%d)", string.sub(pick.id, 1, 6), pick.playing, pick.maxPlayers))
+		local ok, e = teleportToServer(pick.id)
+		if ok then
+			return -- TeleportInitFailed handler retries if the join is refused
+		end
+		setStatus("hunt: teleport error - " .. tostring(e))
+		task.wait(CONFIG.Hunt.RetrySeconds)
+	end
+end
+
+local function huntCycle(token)
+	if not game:IsLoaded() then
+		game.Loaded:Wait()
+	end
+	setStatus("hunt: settling...")
+	task.wait(CONFIG.Hunt.SettleSeconds)
+	if not alive or token ~= huntToken then
+		return
+	end
+	local fruits = scanFruits()
+	if #fruits > 0 then
+		stopHunt("fruit found: " .. fruits[1].name)
+		notify("Wrench Fruit", "Fruit found: " .. fruits[1].name)
+		return
+	end
+	hop(token)
+end
+
+local function startHunt()
+	local ok, why = canHunt()
+	if not ok then
+		setStatus("hunt gated: " .. why)
+		return false
+	end
+	hunting = true
+	state.hunting = true
+	saveState()
+	huntToken = huntToken + 1
+	local token = huntToken
+	task.spawn(huntCycle, token)
+	return true
+end
+
+track(TeleportService.TeleportInitFailed:Connect(function(player, result, message)
+	if player ~= LocalPlayer or not hunting then
+		return
+	end
+	setStatus("hunt: join refused (" .. tostring(result) .. "), retrying")
+	local token = huntToken
+	task.delay(CONFIG.Hunt.RetrySeconds, function()
+		if alive and hunting and token == huntToken then
+			hop(token)
+		end
+	end)
+end))
+
+------------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------------
+local COLOR = {
+	bg = Color3.fromRGB(24, 22, 32),
+	panel = Color3.fromRGB(38, 35, 50),
+	accent = Color3.fromRGB(255, 140, 190),
+	text = Color3.fromRGB(240, 236, 248),
+	dim = Color3.fromRGB(160, 152, 178),
+}
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local function round(o, r)
+	mk("UICorner", { CornerRadius = UDim.new(0, r) }, o)
+end
+
+local function makeDraggable(handle, target)
+	local dragging, dragStart, startPos = false, nil, nil
+	local info = { moved = false }
+	track(handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, info.moved = true, false
+			dragStart, startPos = input.Position, target.Position
+			local conn
+			conn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					conn:Disconnect()
+				end
+			end)
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			if d.Magnitude > 4 then
+				info.moved = true
+			end
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	return info
+end
+
+local function loadLogo()
+	if not (EX.isfile and EX.getcustomasset) or not EX.isfile(path(P.Logo)) then
+		return nil
+	end
+	local ok, asset = pcall(EX.getcustomasset, path(P.Logo))
+	return ok and asset or nil
+end
+
+local function buildGui()
+	local parent = (EX.gethui and EX.gethui()) or CoreGui
+	gui = Instance.new("ScreenGui")
+	gui.Name = "WrenchFruitFinder"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	if EX.protect then
+		pcall(EX.protect, gui)
+	end
+	local okParent = pcall(function()
+		gui.Parent = parent
+	end)
+	if not okParent then
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+
+	local logo = loadLogo()
+
+	-- Floating logo bubble (shown while the menu is hidden)
+	local bubble = mk("ImageButton", {
+		Name = "Bubble",
+		Size = UDim2.fromOffset(46, 46),
+		Position = UDim2.new(0, 10, 0.5, -23),
+		BackgroundColor3 = COLOR.accent,
+		Image = logo or "",
+		Text = "",
+		Visible = false,
+		AutoButtonColor = false,
+	}, gui)
+	round(bubble, 23)
+	mk("UIStroke", { Color = COLOR.accent, Thickness = 2 }, bubble)
+	if not logo then
+		mk("TextLabel", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "W",
+			Font = Enum.Font.GothamBold, TextSize = 20, TextColor3 = COLOR.bg,
+		}, bubble)
+	end
+	local bubbleDrag = makeDraggable(bubble, bubble)
+
+	-- Window
+	local win = mk("Frame", {
+		Name = "Window",
+		Size = UDim2.fromOffset(290, 340),
+		Position = UDim2.new(0, 20, 0, 70),
+		BackgroundColor3 = COLOR.bg,
+		BorderSizePixel = 0,
+	}, gui)
+	round(win, 10)
+	mk("UIStroke", { Color = COLOR.accent, Thickness = 1.5, Transparency = 0.4 }, win)
+
+	local function setVisible(v)
+		win.Visible = v
+		bubble.Visible = not v
+	end
+
+	track(bubble.Activated:Connect(function()
+		if not bubbleDrag.moved then
+			setVisible(true)
+		end
+	end))
+	track(UserInputService.InputBegan:Connect(function(input, processed)
+		if not processed and input.KeyCode == CONFIG.UI.ToggleKey then
+			setVisible(not win.Visible)
+		end
+	end))
+
+	-- Header
+	local header = mk("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = COLOR.panel, BorderSizePixel = 0 }, win)
+	round(header, 10)
+	makeDraggable(header, win)
+	local icon = mk("ImageLabel", {
+		Size = UDim2.fromOffset(26, 26), Position = UDim2.fromOffset(6, 5),
+		BackgroundColor3 = COLOR.accent, Image = logo or "",
+	}, header)
+	round(icon, 13)
+	mk("TextLabel", {
+		Size = UDim2.new(1, -110, 1, 0), Position = UDim2.fromOffset(38, 0), BackgroundTransparency = 1,
+		Text = "Wrench Fruit Finder", Font = Enum.Font.GothamBold, TextSize = 13,
+		TextColor3 = COLOR.text, TextXAlignment = Enum.TextXAlignment.Left,
+	}, header)
+
+	local function headerButton(text, xFromRight, cb)
+		local b = mk("TextButton", {
+			Size = UDim2.fromOffset(26, 24), Position = UDim2.new(1, xFromRight, 0, 6),
+			BackgroundColor3 = COLOR.bg, Text = text, Font = Enum.Font.GothamBold,
+			TextSize = 14, TextColor3 = COLOR.text,
+		}, header)
+		round(b, 6)
+		track(b.Activated:Connect(cb))
+	end
+	headerButton("-", -62, function()
+		setVisible(false)
+	end)
+	headerButton("x", -32, function()
+		genv.WrenchFruitFinder.Unload()
+	end)
+
+	-- Tabs
+	local pages = {}
+	local tabButtons = {}
+	local function selectTab(name)
+		for n, p in pairs(pages) do
+			p.Visible = (n == name)
+			tabButtons[n].BackgroundColor3 = (n == name) and COLOR.accent or COLOR.panel
+			tabButtons[n].TextColor3 = (n == name) and COLOR.bg or COLOR.text
+		end
+	end
+	local function addTab(name, x)
+		local b = mk("TextButton", {
+			Size = UDim2.fromOffset(133, 24), Position = UDim2.fromOffset(x, 42),
+			BackgroundColor3 = COLOR.panel, Text = name, Font = Enum.Font.GothamMedium,
+			TextSize = 12, TextColor3 = COLOR.text,
+		}, win)
+		round(b, 6)
+		tabButtons[name] = b
+		pages[name] = mk("Frame", {
+			Size = UDim2.fromOffset(274, 240), Position = UDim2.fromOffset(8, 72),
+			BackgroundTransparency = 1, Visible = false,
+		}, win)
+		track(b.Activated:Connect(function()
+			selectTab(name)
+		end))
+	end
+	addTab("Fruit", 8)
+	addTab("Server", 149)
+
+	-- Status bar
+	statusLabel = mk("TextLabel", {
+		Size = UDim2.new(1, -16, 0, 22), Position = UDim2.new(0, 8, 1, -26), BackgroundColor3 = COLOR.panel,
+		Text = "ready", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = COLOR.dim,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, win)
+	round(statusLabel, 6)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 6) }, statusLabel)
+
+	-- Widgets
+	local function button(parent, text, size, pos, cb)
+		local b = mk("TextButton", {
+			Size = size, Position = pos, BackgroundColor3 = COLOR.panel, Text = text,
+			Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = COLOR.text,
+		}, parent)
+		round(b, 6)
+		track(b.Activated:Connect(cb))
+		return b
+	end
+
+	local function toggle(parent, label, size, pos, initial, onChange)
+		local value = initial
+		local b = mk("TextButton", {
+			Size = size, Position = pos, Font = Enum.Font.GothamMedium, TextSize = 11, Text = "",
+			BackgroundColor3 = COLOR.panel, TextColor3 = COLOR.text,
+		}, parent)
+		round(b, 6)
+		local function paint()
+			b.Text = label .. ": " .. (value and "ON" or "OFF")
+			b.BackgroundColor3 = value and COLOR.accent or COLOR.panel
+			b.TextColor3 = value and COLOR.bg or COLOR.text
+		end
+		paint()
+		track(b.Activated:Connect(function()
+			local nv = not value
+			if onChange(nv) ~= false then
+				value = nv
+			end
+			paint()
+		end))
+		return {
+			set = function(v)
+				value = v
+				paint()
+			end,
+		}
+	end
+
+	local function listFrame(parent, y, h)
+		local sf = mk("ScrollingFrame", {
+			Size = UDim2.new(1, 0, 0, h), Position = UDim2.fromOffset(0, y), BackgroundColor3 = COLOR.panel,
+			BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		}, parent)
+		round(sf, 6)
+		mk("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+		return sf
+	end
+
+	local function label(parent, text, size, pos, textSize, xAlign)
+		return mk("TextLabel", {
+			Size = size, Position = pos, BackgroundTransparency = 1, Text = text, Font = Enum.Font.Gotham,
+			TextSize = textSize or 11, TextColor3 = COLOR.text, TextXAlignment = xAlign or Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		}, parent)
+	end
+
+	-------------------------------------------------- Fruit page
+	local fp = pages.Fruit
+	toggle(fp, "Auto Grab", UDim2.fromOffset(88, 24), UDim2.fromOffset(0, 0), Settings.AutoGrab, function(v)
+		Settings.AutoGrab = v
+		saveState()
+	end)
+	toggle(fp, "Instant TP", UDim2.fromOffset(88, 24), UDim2.fromOffset(92, 0), Settings.InstantTP, function(v)
+		Settings.InstantTP = v
+		saveState()
+	end)
+	local modeOrder = { "Auto", "Touch", "Teleport" }
+	local modeButton
+	modeButton = button(fp, "Grab: " .. Settings.GrabMode, UDim2.fromOffset(90, 24), UDim2.fromOffset(184, 0), function()
+		for i, m in ipairs(modeOrder) do
+			if m == Settings.GrabMode then
+				Settings.GrabMode = modeOrder[(i % #modeOrder) + 1]
+				break
+			end
+		end
+		modeButton.Text = "Grab: " .. Settings.GrabMode
+		saveState()
+	end)
+	button(fp, "Dump", UDim2.fromOffset(60, 22), UDim2.fromOffset(0, 28), dumpWorkspace)
+	local countLabel = label(fp, "Fruit: 0", UDim2.fromOffset(200, 22), UDim2.fromOffset(66, 28), 11)
+	local fruitList = listFrame(fp, 54, 186)
+	local emptyLabel = label(fruitList, "", UDim2.new(1, -8, 0, 40), UDim2.fromOffset(4, 4), 11)
+	emptyLabel.TextWrapped = true
+	emptyLabel.TextColor3 = COLOR.dim
+
+	local fruitRows = {}
+	local function makeFruitRow(f)
+		local fr = mk("Frame", { Size = UDim2.new(1, -6, 0, 26), BackgroundColor3 = COLOR.bg, BorderSizePixel = 0 }, fruitList)
+		round(fr, 5)
+		label(fr, f.name, UDim2.fromOffset(108, 26), UDim2.fromOffset(6, 0), 11)
+		local dist = label(fr, "?", UDim2.fromOffset(44, 26), UDim2.fromOffset(114, 0), 11)
+		dist.TextColor3 = COLOR.accent
+		button(fr, "TP", UDim2.fromOffset(36, 20), UDim2.fromOffset(160, 3), function()
+			local live = toFruit(f.inst)
+			if not live then
+				return setStatus("fruit no longer valid")
+			end
+			runExclusive("teleport", function()
+				return teleportTo(live, CONFIG.Teleport.HoverOffset)
+			end)
+		end)
+		button(fr, "Grab", UDim2.fromOffset(44, 20), UDim2.fromOffset(200, 3), function()
+			local live = toFruit(f.inst)
+			if not live then
+				return setStatus("fruit no longer valid")
+			end
+			runExclusive("grab", function()
+				return grab(live)
+			end)
+		end)
+		return { frame = fr, dist = dist }
+	end
+
+	local function syncFruitRows(fruits)
+		local seen, n = {}, 0
+		for i, f in ipairs(fruits) do
+			if i > CONFIG.UI.MaxRows then
+				break
+			end
+			n = n + 1
+			seen[f.inst] = true
+			local r = fruitRows[f.inst]
+			if not r then
+				r = makeFruitRow(f)
+				fruitRows[f.inst] = r
+			end
+			r.dist.Text = formatDistance(f.distance)
+			r.frame.LayoutOrder = i
+		end
+		for inst, r in pairs(fruitRows) do
+			if not seen[inst] then
+				r.frame:Destroy()
+				fruitRows[inst] = nil
+			end
+		end
+		countLabel.Text = "Fruit: " .. tostring(#fruits) .. "  (studs)"
+		if not CONFIG.Fruit.NameContains then
+			emptyLabel.Text = "Fruit matcher is UNSET. Press Dump, then set Fruit.NameContains."
+		elseif n == 0 then
+			emptyLabel.Text = "No fruit in this server right now."
+		end
+		emptyLabel.Visible = (n == 0)
+	end
+
+	-------------------------------------------------- Server page
+	local sp = pages.Server
+	huntToggle = toggle(sp, "Hunt", UDim2.fromOffset(100, 24), UDim2.fromOffset(0, 0), false, function(v)
+		if v then
+			return startHunt()
+		end
+		stopHunt("hunt stopped")
+	end)
+	local serverList = listFrame(sp, 60, 180)
+	local serverRows = {}
+
+	local function renderServers(list)
+		for _, r in ipairs(serverRows) do
+			r:Destroy()
+		end
+		serverRows = {}
+		local shown = 0
+		for _, s in ipairs(list) do
+			if shown >= CONFIG.Servers.ListRows then
+				break
+			end
+			if type(s.id) == "string" and s.id ~= game.JobId and isFinite(s.playing) and isFinite(s.maxPlayers) then
+				shown = shown + 1
+				local fr = mk("Frame", { Size = UDim2.new(1, -6, 0, 26), BackgroundColor3 = COLOR.bg, BorderSizePixel = 0, LayoutOrder = shown }, serverList)
+				round(fr, 5)
+				label(fr, string.sub(s.id, 1, 8) .. "  " .. s.playing .. "/" .. s.maxPlayers, UDim2.fromOffset(170, 26), UDim2.fromOffset(6, 0), 11)
+				button(fr, "Join", UDim2.fromOffset(50, 20), UDim2.fromOffset(200, 3), function()
+					local ok, e = teleportToServer(s.id)
+					setStatus(ok and "joining server..." or ("join error: " .. tostring(e)))
+				end)
+				serverRows[#serverRows + 1] = fr
+			end
+		end
+	end
+
+	button(sp, "Hop now", UDim2.fromOffset(80, 24), UDim2.fromOffset(104, 0), function()
+		if busy then
+			return
+		end
+		busy = true
+		task.spawn(function()
+			local list, err = fetchServers()
+			if not list then
+				busy = false
+				return setStatus("list failed: " .. tostring(err))
+			end
+			local now = os.time()
+			local pick = chooseServer(list, state.visited, game.JobId, now, CONFIG.Servers.VisitedTtlSeconds, CONFIG.Servers.MinFreeSlots, math.random)
+			busy = false
+			if not pick then
+				return setStatus("no unvisited server")
+			end
+			state.visited[game.JobId] = now
+			state.visited[pick.id] = now
+			saveState()
+			local ok, e = teleportToServer(pick.id)
+			setStatus(ok and "hopping..." or ("hop error: " .. tostring(e)))
+		end)
+	end)
+	button(sp, "Refresh", UDim2.fromOffset(84, 24), UDim2.fromOffset(188, 0), function()
+		task.spawn(function()
+			setStatus("fetching servers...")
+			local list, err = fetchServers()
+			if not list then
+				return setStatus("list failed: " .. tostring(err))
+			end
+			renderServers(list)
+			setStatus(string.format("%d servers fetched", #list))
+		end)
+	end)
+	local note = label(sp, "Hunt joins a server, scans it, hops if empty. Fruit presence cannot be read before joining.", UDim2.fromOffset(274, 28), UDim2.fromOffset(0, 28), 10)
+	note.TextWrapped = true
+	note.TextColor3 = COLOR.dim
+	note.TextTruncate = Enum.TextTruncate.None
+
+	selectTab("Fruit")
+	setVisible(true)
+	return syncFruitRows
+end
+
+local syncFruitRows = buildGui()
+
+------------------------------------------------------------------------
+-- Main loop
+------------------------------------------------------------------------
+local lastAutoGrab = 0
+task.spawn(function()
+	while alive do
+		local ok, err = pcall(function()
+			local fruits = scanFruits()
+			syncFruitRows(fruits)
+			if Settings.AutoGrab and not busy and #fruits > 0 and getRoot()
+				and os.clock() - lastAutoGrab >= CONFIG.Grab.AutoGrabIntervalSeconds then
+				lastAutoGrab = os.clock()
+				runExclusive("auto-grab", function()
+					local live = toFruit(fruits[1].inst)
+					if not live then
+						return false, "fruit gone"
+					end
+					return grab(live)
+				end)
+			end
+		end)
+		if not ok then
+			setStatus("tick error: " .. tostring(err))
+		end
+		task.wait(CONFIG.UI.RefreshSeconds)
+	end
+end)
+
+------------------------------------------------------------------------
+-- Startup status + resume hunt after a hop
+------------------------------------------------------------------------
+if CONFIG.ExpectedPlaceIds and not CONFIG.ExpectedPlaceIds[game.PlaceId] then
+	setStatus("warning: PlaceId " .. tostring(game.PlaceId) .. " not in ExpectedPlaceIds")
+elseif not CONFIG.Fruit.NameContains then
+	setStatus("fruit matcher UNSET - press Dump")
+end
+
+if state.hunting then
+	local ok, why = canHunt()
+	if ok then
+		hunting = true
+		huntToken = huntToken + 1
+		huntToggle.set(true)
+		task.spawn(huntCycle, huntToken)
+	else
+		stopHunt("hunt cancelled: " .. why)
+	end
+end
+
+------------------------------------------------------------------------
+-- Unload (single cleanup path)
+------------------------------------------------------------------------
+genv.WrenchFruitFinder = {
+	Unload = function()
+		alive = false
+		hunting = false
+		huntToken = huntToken + 1
+		for _, c in ipairs(connections) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+		table.clear(connections)
+		if gui then
+			pcall(function()
+				gui:Destroy()
+			end)
+		end
+		genv.WrenchFruitFinder = nil
+	end,
+}
